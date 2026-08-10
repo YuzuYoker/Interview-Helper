@@ -1,0 +1,19 @@
+.git/
+node_modules/
+.env
+backend/data/
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+docs/
+CLAUDE.md
+project1-rag-knowledge-base-plan.md
+.claude/settings.json
+.claude/settings.local.json
+__pycache__/
+*.pyc
+# 排除杂散 whl，但放行 Dockerfile COPY 的 torch 离线包（构建上下文必须包含它）
+*.whl
+!torch-2.9.1+cpu-cp310-cp310-manylinux_2_28_x86_64.whl
+*.env
+*.log
