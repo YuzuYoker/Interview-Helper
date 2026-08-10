@@ -28,3 +28,4 @@ class Source(BaseModel):
 class ChatResponse(BaseModel):
     answer: str  # 正文含 [1][2] 标注
     sources: list[Source]
+    tool_trace: list[dict] = []  # Agent 工具调用轨迹（非 agent 模式为空）

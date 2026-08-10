@@ -77,3 +77,50 @@ export async function deleteConversation(id) {
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
   return r.json()
 }
+
+// ---- Agent 工作台（记忆/提示词/管道/工具/指标） ----
+export async function listMemories() {
+  const r = await fetch(`${BASE}/agent/memories`)
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return r.json()
+}
+
+export async function addMemory(body) {
+  const r = await fetch(`${BASE}/agent/memories`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`)
+  return r.json()
+}
+
+export async function deleteMemory(id) {
+  const r = await fetch(`${BASE}/agent/memories/${id}`, { method: 'DELETE' })
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return r.json()
+}
+
+export async function getAgentTools() {
+  const r = await fetch(`${BASE}/agent/tools`)
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return r.json()
+}
+
+export async function getPrompts() {
+  const r = await fetch(`${BASE}/agent/prompts`)
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return r.json()
+}
+
+export async function getAgentPipeline() {
+  const r = await fetch(`${BASE}/agent/middleware`)
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return r.json()
+}
+
+export async function getAgentMetrics() {
+  const r = await fetch(`${BASE}/agent/metrics`)
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return r.json()
+}

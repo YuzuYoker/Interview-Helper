@@ -1,15 +1,16 @@
-"""对话接口：RAG 问答（非流式 + SSE 流式，带 Redis 缓存 + 会话持久化）。
+"""对话接口：Agent 问答（非流式 + SSE 流式，带 Redis 缓存 + 会话持久化）。
 
-会话持久化（第5周）：请求带 conversation_id 时，
-- 历史取服务端权威（读库），不依赖前端回传 —— 刷新/重开后上下文仍在；
-- 用户消息先落库（生成失败也不丢），回答完成后 assistant 消息带引用落库；
-- 不带 conversation_id 时保持旧行为（用请求内 history，不落库），兼容测试脚本。
+Agent 模式（AGENT_ENABLED=true）：LLM 通过工具自主决定检索/联网/改写，
+SSE 事件含 thought/tool_call/tool_result（sources/delta/done 兼容旧前端）；
+req.web_search 字段降级为**系统提示 hint**（不再做代码路径触发——完全 LLM 驱动）。
+传统路径（AGENT_ENABLED=false）：回退 build_answer_cached / stream_answer_cached。
 
-联网搜索（第6周）：req.web_search 开关 OR 问题含时效敏感词自动触发
-（build_answer_cached / stream_answer_cached 的 web_search 参数）。
+会话持久化（第5周）：带 conversation_id 时服务端读库取权威历史，
+用户消息先落库（生成失败也不丢），回答完成后 assistant 消息带 sources + tool_trace 落库。
 """
+import asyncio
 import json
-import re
+import threading
 
 from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -24,22 +25,39 @@ from app.utils.config import settings
 
 router = APIRouter()
 
-# 时效敏感词：命中即自动联网（宁可少触发，不误伤"谈薪/简历"等知识库就能答的问题）
-_WEB_AUTO_RE = re.compile(
-    r"最新|今年|最近|近两年|202[4-9]|趋势|行情|新闻|热点|政策|榜单|排行|现状|薪资行情|工资水平|天气"
-)
+
+def _maybe_generate_title(conv_id: str, content: str) -> None:
+    """首条消息后后台生成会话标题（agent_title_auto），非阻塞。"""
+    if not (settings.agent_enabled and settings.agent_title_auto):
+        return
+    try:
+        from app.agent.tools import _generate_title
+
+        threading.Thread(
+            target=_generate_title,
+            kwargs={"conversation_id": conv_id, "content": content},
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
 
 
-def _should_web_search(question: str, flag: bool) -> bool:
-    """触发条件：前端开关 ON，或（自动触发开启 && 含时效敏感词/问题带链接）。"""
-    if not settings.web_search_enabled:
-        return False
-    if flag:
-        return True
-    has_url = bool(re.search(r"https?://", question))
-    return settings.web_search_auto and (
-        has_url or bool(_WEB_AUTO_RE.search(question))
-    )
+def _maybe_extract_memories(question: str, answer: str, conv_id: str | None) -> None:
+    """回答完成后后台抽取长期记忆（结构化抽取 → SQLite memories），非阻塞。"""
+    if not (settings.agent_enabled and conv_id):
+        return
+    try:
+        from langchain_core.messages import AIMessage, HumanMessage
+        from app.agent.memory.long_term import extract_memories
+
+        messages = [HumanMessage(content=question), AIMessage(content=answer)]
+        threading.Thread(
+            target=extract_memories,
+            args=(messages, conv_id),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
 
 
 def _check_request(req: ChatRequest) -> None:
@@ -75,7 +93,7 @@ def chat(req: ChatRequest, response: Response):
 
     if conv_id:
         conversations.append_message(conv_id, "user", question)  # 先落库，防生成失败丢失
-    web_flag = _should_web_search(question, req.web_search)
+    web_flag = req.web_search  # Agent：仅 hint；传统：联网开关
     resp, hit = build_answer_cached(question, history, req.top_k, web_search=web_flag)
     response.headers["X-Cache"] = "HIT" if hit else "MISS"
 
@@ -85,13 +103,17 @@ def chat(req: ChatRequest, response: Response):
             "assistant",
             resp.answer,
             [s.model_dump() for s in resp.sources],
+            resp.tool_trace,
         )
+        _maybe_extract_memories(question, resp.answer, conv_id)
+        if not history:  # 首条消息 → 后台生成标题
+            _maybe_generate_title(conv_id, question)
     return resp
 
 
 @router.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    """SSE 流式：sources → delta* → done/error（缓存命中回放打字机）。
+    """SSE 流式：thought/tool_call/tool_result/sources → delta* → done/error。
 
     注意：不设 response_model（FastAPI 会尝试校验流式响应）。
     """
@@ -101,22 +123,54 @@ async def chat_stream(req: ChatRequest):
 
     async def gen():
         sources_data: list[dict] = []
+        trace_data: list[dict] = []
+        partial: list[str] = []
         if conv_id:
             conversations.append_message(conv_id, "user", question)
-        web_flag = _should_web_search(question, req.web_search)
-        async for event, payload in stream_answer_cached(
-            question, history, req.top_k, web_search=web_flag
-        ):
-            yield (
-                f"event: {event}\n"
-                f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            )
-            if event == "sources":
-                sources_data = payload.get("sources", [])
-            if conv_id and event == "done" and payload.get("answer"):
-                conversations.append_message(
-                    conv_id, "assistant", payload["answer"], sources_data
+        web_flag = req.web_search
+        try:
+            async for event, payload in stream_answer_cached(
+                question, history, req.top_k, web_search=web_flag
+            ):
+                yield (
+                    f"event: {event}\n"
+                    f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 )
+                if event == "sources":
+                    sources_data = payload.get("sources", [])
+                elif event == "delta":
+                    partial.append(payload.get("content", ""))
+                elif event == "tool_call":
+                    trace_data.append(
+                        {"type": "tool_call", "name": payload.get("name"),
+                         "args": payload.get("args", {}),
+                         "tool_call_id": payload.get("tool_call_id")}
+                    )
+                elif event == "tool_result":
+                    trace_data.append(
+                        {"type": "tool_result", "name": payload.get("name"),
+                         "ok": payload.get("ok", True),
+                         "summary": payload.get("summary", ""),
+                         "tool_call_id": payload.get("tool_call_id")}
+                    )
+                if conv_id and event == "done" and payload.get("answer"):
+                    conversations.append_message(
+                        conv_id,
+                        "assistant",
+                        payload["answer"],
+                        sources_data,
+                        payload.get("tool_trace") or trace_data,
+                    )
+                    _maybe_extract_memories(question, payload["answer"], conv_id)
+                    if not history:  # 首条消息 → 后台生成标题
+                        _maybe_generate_title(conv_id, question)
+        except asyncio.CancelledError:
+            # 用户中断：尽量保留已有部分（有内容才落库，保守）
+            if conv_id and "".join(partial).strip():
+                conversations.append_message(
+                    conv_id, "assistant", "".join(partial), sources_data, trace_data
+                )
+            raise
 
     return StreamingResponse(
         gen(),

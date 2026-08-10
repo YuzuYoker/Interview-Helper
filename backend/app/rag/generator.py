@@ -5,15 +5,27 @@
 - 检索等同步 CPU/GPU 调用在 _prepare 中完成，由 API 层 run_in_threadpool 执行
 - 联网搜索（web_items）：由缓存包装层提前执行，注入 _prepare 追加为 [n] 引用
 """
-import re
 from typing import AsyncIterator
 
+from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+from app.agent.state import InterviewAgentState
+from app.agent.streaming import run_agent, stream_agent
 from app.models.chat import ChatResponse, Source
 from app.rag.retriever import retrieve
 from app.utils.config import settings
+
+def _record_metric(**kwargs) -> None:
+    """性能指标落点（best-effort，metrics 模块缺失/异常不影响主链路）。"""
+    try:
+        from app.utils.metrics import record
+
+        record(**kwargs)
+    except Exception:
+        pass
+
 
 SYSTEM_PROMPT = """你是资深面试顾问，服务求职者。请严格基于下面的面试资料库回答问题，禁止编造。
 回答风格：直接、有立场、给出可操作的建议，不用客套话。
@@ -71,20 +83,16 @@ def _build_messages(
     return msgs
 
 
-def _prepare(
-    question: str,
-    history: list[dict] | None,
-    top_k: int | None,
+def hits_to_sources(
+    hits: list[tuple[Document, float]],
     web_items: list[dict] | None = None,
-) -> tuple[list[Source], str] | None:
-    """共享检索步骤：返回 (sources, refs)。
+) -> tuple[list[Source], str]:
+    """把检索命中 (Document, score) 与联网结果组装为 (sources, refs)。
 
-    联网搜索结果（web_items）追加在知识库条目之后，编号顺延（[n+1]…），
-    sources 带 is_web=True 供前端 🌐 展示。两者都无内容才返回 None。
+    与 Agent 的 retrieve_knowledge/web_search 工具共用，保证引用编号 [n] 一致。
+    - 联网结果追加在知识库条目之后，编号顺延（[n+1]…），sources 带 is_web=True；
+    - 为空时返回 ([], "")，由调用方决定是否降级。
     """
-    # 用户文档保送已并入 retrieve（4.5 步），此处无需二次附加
-    hits = retrieve(question, k=top_k, history=history)  # [(Document, score), ...]
-
     refs_parts: list[str] = []
     sources: list[Source] = []
     for i, (d, score) in enumerate(hits):
@@ -124,9 +132,27 @@ def _prepare(
             )
         )
 
+    return sources, "\n".join(refs_parts)
+
+
+def _prepare(
+    question: str,
+    history: list[dict] | None,
+    top_k: int | None,
+    web_items: list[dict] | None = None,
+) -> tuple[list[Source], str] | None:
+    """共享检索步骤：返回 (sources, refs)。
+
+    联网搜索结果（web_items）追加在知识库条目之后，编号顺延（[n+1]…），
+    sources 带 is_web=True 供前端 🌐 展示。两者都无内容才返回 None。
+    """
+    # 用户文档保送已并入 retrieve（4.5 步），此处无需二次附加
+    hits = retrieve(question, k=top_k, history=history)  # [(Document, score), ...]
+    sources, refs = hits_to_sources(hits, web_items)
+
     if not sources:
         return None
-    return sources, "\n".join(refs_parts)
+    return sources, refs
 
 
 def build_answer(
@@ -180,35 +206,65 @@ async def stream_answer(
 # ---- 缓存包装 ----
 
 
-def _resolve_web(
-    question: str, history: list[dict] | None, web_search: bool
+def _resolve_web_legacy(
+    question: str, web_search: bool
 ) -> tuple[list[dict] | None, str]:
-    """联网搜索编排：web_search=True 时执行搜索+抓取，返回 (web_items, web_hash)。
+    """传统 RAG 路径（agent_enabled=False）的联网编排：直接以原问题为搜索词。
 
-    - 搜索 query 复用多轮改写结果（补全指代，如"那公司压价怎么办"→"谈薪压价"）；
-    - 返回空 → (None, "")：走纯知识库路径，缓存 key 不带 web 维度（可复用普通缓存）；
-    - web_hash 并入回答缓存 key：搜索结果变化 → 视为不同回答重新生成。
+    Agent 模式下联网完全由 LLM 通过 web_search/fetch_url 工具决定，不走此函数；
+    此函数只服务旧路径回退（保持 build_answer_cached/stream_answer_cached 兼容）。
     """
     if not web_search or not settings.web_search_enabled:
         return None, ""
     from app.rag import web_search as ws
-    from app.rag.query_optimizer import rewrite_query
 
-    # 1) 问题里带 http(s):// 链接 → 直接抓取该网页（不走 Bing 搜索）。
-    #    只匹配合法 URL 字符集，避免吞掉紧跟的中文句尾（"…github.com/吗"→只取到 /）
-    url_m = re.search(
-        r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+", question
+    items = ws.web_search(question)
+    return (items, ws.web_hash(items)) if items else (None, "")
+
+
+def build_agent_answer_cached(
+    question: str,
+    history: list[dict] | None = None,
+    top_k: int | None = None,
+    web_hint: bool = False,
+) -> tuple[ChatResponse, bool]:
+    """Agent 非流式 + 缓存：命中返回 (response, True)。
+
+    web_hint 仅作系统提示 hint（完全由 LLM 决定是否联网）；缓存 key 并入 web_hint
+    与工具轨迹，联网/不联网回答互不污染。
+    """
+    import time as _time
+
+    from app.utils.cache import get_agent_cached, set_agent_cached
+
+    k = top_k or settings.top_k
+    start = _time.monotonic()
+    cached = get_agent_cached(question, history, k, web_hint)
+    if cached is not None:
+        _record_metric(cache_hit=True, total_ms=round((_time.monotonic() - start) * 1000, 1))
+        sources = [Source(**s) for s in cached.get("sources", [])]
+        return ChatResponse(
+            answer=cached["answer"],
+            sources=sources,
+            tool_trace=cached.get("tool_trace", []),
+        ), True
+
+    state = InterviewAgentState(question=question, history=history or [], top_k=k, web_hint=web_hint)
+    resp = run_agent(state)
+    _record_metric(cache_hit=False, total_ms=round((_time.monotonic() - start) * 1000, 1),
+                   tool_calls=len(resp.tool_trace))
+    set_agent_cached(
+        question,
+        history,
+        k,
+        {
+            "answer": resp.answer,
+            "sources": [s.model_dump() for s in resp.sources],
+            "tool_trace": resp.tool_trace,
+        },
+        web_hint,
     )
-    if url_m:
-        items = ws.fetch_url(url_m.group(0))
-        return (items, ws.web_hash(items)) if items else (None, "")
-
-    # 2) 常规搜索：多轮改写 → 天气类搜索词规范化（"X天气如何"→"X天气预报"）
-    query = ws.optimize_search_query(rewrite_query(question, history or []))
-    items = ws.web_search(query)
-    if not items:
-        return None, ""
-    return items, ws.web_hash(items)
+    return resp, False
 
 
 def build_answer_cached(
@@ -217,14 +273,17 @@ def build_answer_cached(
     top_k: int | None = None,
     web_search: bool = False,
 ) -> tuple[ChatResponse, bool]:
-    """带缓存：命中直接返回 (response, True)。
+    """带缓存：agent_enabled 走 Agent 循环，否则回退传统 RAG（web_search 作为开关）。
 
-    web_search=True 时先执行联网搜索（结果进上下文 + 缓存 key 带 web 维度）。
+    返回值与旧签名兼容：(ChatResponse, is_hit)。
     """
+    if settings.agent_enabled:
+        return build_agent_answer_cached(question, history, top_k, web_hint=web_search)
+
     from app.utils.cache import get_cached_answer, set_cached_answer
 
     k = top_k or settings.top_k
-    web_items, web_hash = _resolve_web(question, history, web_search)
+    web_items, web_hash = _resolve_web_legacy(question, web_search)
     cached = get_cached_answer(question, history, k, bool(web_items), web_hash)
     if cached is not None:
         sources = [Source(**s) for s in cached.get("sources", [])]
@@ -245,22 +304,128 @@ def build_answer_cached(
     return resp, False
 
 
+def _replay_trace_event(entry: dict) -> tuple[str, dict]:
+    """把持久化的 tool_trace 条目转成 SSE 事件（缓存命中回放用）。"""
+    t = entry.get("type")
+    if t == "tool_call":
+        return (
+            "tool_call",
+            {
+                "tool_call_id": entry.get("tool_call_id", ""),
+                "name": entry.get("name", ""),
+                "args": entry.get("args", {}),
+            },
+        )
+    if t == "tool_result":
+        return (
+            "tool_result",
+            {
+                "tool_call_id": entry.get("tool_call_id", ""),
+                "name": entry.get("name", ""),
+                "ok": entry.get("ok", True),
+                "summary": entry.get("summary", ""),
+            },
+        )
+    return ("thought", {"type": "info", "message": entry.get("summary", "")})
+
+
+async def stream_agent_cached(
+    question: str,
+    history: list[dict] | None,
+    top_k: int | None,
+    web_hint: bool = False,
+    conv_id: str | None = None,
+) -> AsyncIterator[tuple[str, dict]]:
+    """Agent 流式 + 缓存：SSE 事件协议含 thought/tool_call/tool_result。
+
+    命中回放：thought(命中) → tool_trace 逐条 → sources → 打字机 delta → done；
+    未命中：跑 stream_agent，done 时写入 agent 缓存。
+    """
+    import asyncio
+    import time as _time
+
+    from app.utils.cache import get_agent_cached, set_agent_cached
+
+    k = top_k or settings.top_k
+    start = _time.monotonic()
+    cached = get_agent_cached(question, history, k, web_hint)
+    if cached is not None:
+        _record_metric(cache_hit=True, total_ms=round((_time.monotonic() - start) * 1000, 1))
+        yield ("thought", {"type": "info", "message": "命中缓存，回放上一次处理过程"})
+        for entry in cached.get("tool_trace", []):
+            yield _replay_trace_event(entry)
+        yield ("sources", {"sources": cached.get("sources", [])})
+        answer = cached["answer"]
+        for i in range(0, len(answer), 2):  # 切小块模拟打字机
+            yield ("delta", {"content": answer[i : i + 2]})
+            await asyncio.sleep(0.003)
+        yield ("done", {
+            "answer": answer,
+            "source_count": len(cached.get("sources", [])),
+            "tool_trace": cached.get("tool_trace", []),
+        })
+        return
+
+    sources_data: list[dict] = []
+    trace_data: list[dict] = []
+    state = InterviewAgentState(
+        question=question, history=history or [], top_k=k,
+        web_hint=web_hint, conversation_id=conv_id,
+    )
+    async for event, payload in stream_agent(state):
+        if event == "sources":
+            sources_data = payload.get("sources", [])
+        elif event == "tool_call":
+            trace_data.append({"type": "tool_call", "name": payload.get("name"),
+                               "args": payload.get("args", {}),
+                               "tool_call_id": payload.get("tool_call_id", "")})
+        elif event == "tool_result":
+            trace_data.append({"type": "tool_result", "name": payload.get("name"),
+                               "ok": payload.get("ok", True),
+                               "summary": payload.get("summary", ""),
+                               "tool_call_id": payload.get("tool_call_id", "")})
+        elif event == "done":
+            payload = {**payload, "tool_trace": trace_data}  # 注入轨迹，供 chat.py 持久化
+            _record_metric(cache_hit=False, total_ms=round((_time.monotonic() - start) * 1000, 1),
+                           tool_calls=len(trace_data))
+            set_agent_cached(
+                question,
+                history,
+                k,
+                {
+                    "answer": payload["answer"],
+                    "sources": sources_data,
+                    "tool_trace": trace_data,
+                },
+                web_hint,
+            )
+        yield event, payload
+
+
 async def stream_answer_cached(
     question: str,
     history: list[dict] | None,
     top_k: int | None,
     web_search: bool = False,
 ) -> AsyncIterator[tuple[str, dict]]:
-    """带缓存的流式：SSE 事件协议不变（前端零改动）。
+    """带缓存的流式：agent_enabled 走 Agent 循环（含 thought/tool_call 事件），
+    否则回退传统 RAG（前端零改动）。
 
     缓存命中时回放：sources → 按 2 字切 delta（3ms 间隔，保留打字机效果）→ done。
     """
+    if settings.agent_enabled:
+        async for ev, payload in stream_agent_cached(
+            question, history, top_k, web_hint=web_search
+        ):
+            yield ev, payload
+        return
+
     import asyncio
 
-    from app.utils.cache import get_cached_answer
+    from app.utils.cache import get_cached_answer, set_cached_answer
 
     k = top_k or settings.top_k
-    web_items, web_hash = _resolve_web(question, history, web_search)
+    web_items, web_hash = _resolve_web_legacy(question, web_search)
     cached = get_cached_answer(question, history, k, bool(web_items), web_hash)
     if cached is not None:
         yield ("sources", {"sources": cached.get("sources", [])})
@@ -277,8 +442,6 @@ async def stream_answer_cached(
         if ev == "sources":
             sources_data = payload.get("sources", [])
         if ev == "done" and payload.get("answer"):
-            from app.utils.cache import set_cached_answer
-
             set_cached_answer(
                 question,
                 history,

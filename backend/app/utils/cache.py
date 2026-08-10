@@ -147,6 +147,80 @@ def set_cached_answer(
         pass
 
 
+# ---- Agent 回答缓存（key 含 tool_trace 哈希，命中回放工具轨迹）----
+
+
+def _agent_key(
+    question: str,
+    history: list[dict] | None,
+    top_k: int,
+    web_hint: bool = False,
+    trace_hash: str = "",
+) -> str:
+    payload = json.dumps(
+        [question, history or [], top_k, bool(web_hint), trace_hash],
+        ensure_ascii=False,
+    )
+    h = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    return f"rag:agent:{get_kv()}:{h}"
+
+
+def get_agent_cached(
+    question: str,
+    history: list[dict] | None,
+    top_k: int,
+    web_hint: bool = False,
+    trace_hash: str = "",
+) -> Optional[dict]:
+    """命中返回 {"answer","sources","tool_trace","trace_hash"}。
+
+    trace_hash 非空时并入 key（同一工具路径复用）；空时用探测键（问题+历史）。
+    """
+    if not settings.redis_url:
+        return None
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        raw = c.get(_agent_key(question, history, top_k, web_hint, trace_hash))
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def set_agent_cached(
+    question: str,
+    history: list[dict] | None,
+    top_k: int,
+    payload: dict,
+    web_hint: bool = False,
+    trace_hash: str = "",
+) -> None:
+    if not settings.redis_url:
+        return
+    c = _get_client()
+    if c is None:
+        return
+    try:
+        c.setex(
+            _agent_key(question, history, top_k, web_hint, trace_hash),
+            settings.cache_ttl,
+            json.dumps(payload, ensure_ascii=False),
+        )
+    except Exception:
+        pass
+
+
+def trace_hash_of(tool_trace: list[dict]) -> str:
+    """工具轨迹哈希：并入 agent 缓存 key，轨迹不同视为不同回答。"""
+    if not tool_trace:
+        return ""
+    h = hashlib.sha256(
+        json.dumps(tool_trace, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    return h
+
+
 # ---- 联网搜索结果缓存（页级，独立于回答缓存）----
 
 

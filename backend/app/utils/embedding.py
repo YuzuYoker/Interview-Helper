@@ -28,9 +28,9 @@ class BGEZhEmbeddings(BaseModel, Embeddings):
         if self._model is None:
             with self._lock:  # 双检锁，防并发重复加载
                 if self._model is None:
-                    dev = self.device or (
-                        "cuda" if torch.cuda.is_available() else "cpu"
-                    )
+                    dev = self.device or ""
+                    if dev in ("", "auto"):  # auto/None => 自动检测
+                        dev = "cuda" if torch.cuda.is_available() else "cpu"
                     self._model = SentenceTransformer(self.model_name, device=dev)
         return self._model
 
@@ -60,5 +60,9 @@ _embedding: Optional[BGEZhEmbeddings] = None
 def get_embedding_model() -> BGEZhEmbeddings:
     global _embedding
     if _embedding is None:
-        _embedding = BGEZhEmbeddings()  # device=None，_load 时自动检测
+        from app.utils.config import settings
+        _embedding = BGEZhEmbeddings(
+            model_name=settings.embedding_model,
+            device=settings.embedding_device,
+        )
     return _embedding

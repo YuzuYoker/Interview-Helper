@@ -40,22 +40,42 @@ def rrf_fuse(ranked_ids: list[list[str]], k: int | None = None) -> list[str]:
     return [did for did, _ in sorted(scores.items(), key=lambda x: -x[1])]
 
 
+def _tag_filter(tags: list[str] | None):
+    """Qdrant Filter：metadata.tags 命中任一标签。Agent 按标签过滤检索用。"""
+    if not tags:
+        return None
+    from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+    return Filter(must=[FieldCondition(key="metadata.tags", match=MatchAny(any=list(tags)))])
+
+
 def _optimize_query(
-    question: str, history: list[dict] | None
+    question: str,
+    history: list[dict] | None,
+    hyde_enabled: bool | None = None,
+    query_multiview: bool | None = None,
+    query_rewrite: bool | None = None,
 ) -> list[str]:
-    """返回用于检索的 query 列表（可能多个视角）。全部失败降级原问题。"""
-    if settings.hyde_enabled:  # 实验项：HyDE 用假设文档检索
+    """返回用于检索的 query 列表（可能多个视角）。全部失败降级原问题。
+
+    显式参数优先；None 时读 settings（传统路径用配置开关，Agent 路径传显式值绕过）。
+    """
+    hyde = settings.hyde_enabled if hyde_enabled is None else hyde_enabled
+    mv = settings.query_multiview if query_multiview is None else query_multiview
+    rw = settings.query_rewrite if query_rewrite is None else query_rewrite
+
+    if hyde:  # 实验项：HyDE 用假设文档检索
         from app.rag.query_optimizer import build_hyde
 
-        hyde = build_hyde(question)
-        return [hyde] if hyde else [question]
+        h = build_hyde(question)
+        return [h] if h else [question]
 
     if history:
-        if settings.query_multiview:  # 实验项：多视角扩展
+        if mv:  # 实验项：多视角扩展
             from app.rag.query_optimizer import rewrite_multiview
 
             return rewrite_multiview(question, history) or [question]
-        if settings.query_rewrite:  # 多轮改写（默认路径）
+        if rw:  # 多轮改写（默认路径）
             from app.rag.query_optimizer import rewrite_query
 
             return [rewrite_query(question, history) or question]
@@ -63,7 +83,7 @@ def _optimize_query(
 
 
 def _retrieve_user_docs(
-    queries: list[str], k: int
+    queries: list[str], k: int, tags: list[str] | None = None
 ) -> list[tuple[Document, float]]:
     """用户库（kb_documents）：按文档聚合召回，相关文档 chunk 全量进上下文。
 
@@ -76,11 +96,12 @@ def _retrieve_user_docs(
     2. 取最相关 1-2 个文档，其 chunk **全量**返回（每文档上限 8，防大文档爆上下文）。
     """
     store = get_store(get_embedding_model(), collection=settings.qdrant_collection)
+    qfilter = _tag_filter(tags)
 
     # 1. 向量打分 → 按 doc_id 聚合文档得分（取每个文档的最佳 chunk 分）
     doc_score: dict[str, float] = defaultdict(float)
     for q in queries:
-        for _d, s in store.similarity_search_with_score(q, k=6):
+        for _d, s in store.similarity_search_with_score(q, k=6, filter=qfilter):
             did = (_d.metadata.get("doc_id") or "")
             if did:
                 doc_score[did] = max(doc_score.get(did, 0.0), s)
@@ -133,10 +154,17 @@ def _retrieve_user_docs(
 
 
 def _retrieve_references(
-    queries: list[str], k: int
+    queries: list[str],
+    k: int,
+    enable_reranker: bool | None = None,
+    enable_bm25: bool | None = None,
+    tags: list[str] | None = None,
 ) -> list[tuple[Document, float]]:
     """参考库（kb_references）：双路检索 + RRF + Reranker 精排。"""
     cand = settings.reranker_top_k
+    rerank = settings.enable_reranker if enable_reranker is None else enable_reranker
+    bm25_on = settings.enable_bm25 if enable_bm25 is None else enable_bm25
+    qfilter = _tag_filter(tags)
     store = get_store(
         get_embedding_model(), collection=settings.qdrant_reference_collection
     )
@@ -146,11 +174,11 @@ def _retrieve_references(
     dense_scores: dict[str, float] = {}
     sparse_ranks: list[list[str]] = []
     for q in queries:
-        for d, s in store.similarity_search_with_score(q, k=cand):
+        for d, s in store.similarity_search_with_score(q, k=cand, filter=qfilter):
             did = uuid5_id(d.page_content)
             dense_map[did] = d
             dense_scores[did] = max(dense_scores.get(did, 0.0), s)
-    if settings.enable_bm25:
+    if bm25_on:
         for q in queries:
             ref_ids = []
             for did in bm25_index.search(q, settings.bm25_top_k):
@@ -175,7 +203,7 @@ def _retrieve_references(
             candidates.append((doc, dense_scores.get(did, 0.0)))
 
     # 4. Reranker 精排（可选）
-    if settings.enable_reranker and candidates:
+    if rerank and candidates:
         from app.rag.reranker import reranker
 
         return reranker.rerank(queries[0], [d for d, _ in candidates], k)
@@ -187,12 +215,26 @@ def retrieve(
     question: str,
     k: int | None = None,
     history: list[dict] | None = None,
+    collection: str = "auto",  # auto 用户+参考 | user 仅用户 | reference 仅参考
+    enable_reranker: bool | None = None,
+    enable_bm25: bool | None = None,
+    hyde_enabled: bool | None = None,
+    query_multiview: bool | None = None,
+    query_rewrite: bool | None = None,
+    tags: list[str] | None = None,
 ) -> list[tuple[Document, float]]:
+    """检索入口。Agent 路径传入显式参数（绕过配置开关）；传统路径向后兼容。"""
     k = k or settings.top_k
-    queries = _optimize_query(question, history)
+    queries = _optimize_query(
+        question, history, hyde_enabled, query_multiview, query_rewrite
+    )
 
-    user_hits = _retrieve_user_docs(queries, k=2)
-    ref_hits = _retrieve_references(queries, k)
+    user_hits: list[tuple[Document, float]] = []
+    ref_hits: list[tuple[Document, float]] = []
+    if collection in ("auto", "user"):
+        user_hits = _retrieve_user_docs(queries, k=2, tags=tags)
+    if collection in ("auto", "reference"):
+        ref_hits = _retrieve_references(queries, k, enable_reranker, enable_bm25, tags)
 
     # 用户文档在前（用户上传的资料是用户最关心的内容，LLM 优先参考）；
     # 参考资料在后（方法论支持）。

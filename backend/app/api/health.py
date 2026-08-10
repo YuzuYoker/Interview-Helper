@@ -1,4 +1,4 @@
-"""健康检查接口。"""
+"""健康检查接口：collect_health() 探针与 /health 端点共用（Agent diagnose_system 工具复用）。"""
 import torch
 from fastapi import APIRouter
 
@@ -9,8 +9,8 @@ from app.utils.embedding import get_embedding_model
 router = APIRouter()
 
 
-@router.get("/health")
-def health():
+def collect_health() -> dict:
+    """聚合各组件状态（端点与 Agent 工具共用，避免逻辑重复）。"""
     from app.utils.cache import redis_ok
 
     embedding = get_embedding_model()  # 轻量对象，不触发模型加载
@@ -27,3 +27,8 @@ def health():
         "llm_configured": bool(settings.deepseek_api_key),
         "llm_model": settings.model,
     }
+
+
+@router.get("/health")
+def health():
+    return collect_health()

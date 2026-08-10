@@ -103,10 +103,14 @@ def qdrant_ok() -> bool:
         return False
 
 
-def scroll_all_chunks(collection: Optional[str] = None) -> list[dict]:
-    """scroll 指定 collection 全量 chunk 的原始 payload（BM25 索引重建用）。
+def scroll_all_chunks(
+    collection: Optional[str] = None,
+    qdrant_filter: Optional[Filter] = None,
+) -> list[dict]:
+    """scroll 指定 collection 全量 chunk 的原始 payload（BM25 索引重建 / 标签过滤用）。
 
     不传 collection 时扫两个库合并（BM25 需要全局词频分布）。
+    qdrant_filter：Qdrant Filter，如 metadata.tags 命中过滤（auto_tag 按标签检索）。
     """
     client = get_client()
     if collection:
@@ -123,8 +127,44 @@ def scroll_all_chunks(collection: Optional[str] = None) -> list[dict]:
                 limit=10000,
                 with_payload=True,
                 with_vectors=False,
+                scroll_filter=qdrant_filter,
             )
             out.extend(p.payload or {} for p in points)
         except Exception:
             continue
     return out
+
+
+def update_document_payload(
+    doc_id: str, extra_meta: dict, collection: Optional[str] = None
+) -> None:
+    """给某文档的所有 chunk 追加 metadata（自动标签/关键词/摘要）。
+
+    Qdrant set_payload 是**顶层浅合并**，嵌套的 metadata 对象必须整体重建：
+    scroll 定位 → 拷贝旧 metadata → 合并 extra_meta → set_payload。
+    """
+    name = collection or settings.qdrant_collection
+    client = get_client()
+    try:
+        if not client.collection_exists(name):
+            return
+        points, _ = client.scroll(
+            name,
+            limit=10000,
+            with_payload=True,
+            with_vectors=False,
+            scroll_filter=Filter(
+                must=[FieldCondition(key="metadata.doc_id", match=MatchValue(value=doc_id))]
+            ),
+        )
+        if not points:
+            return
+        ids = [p.id for p in points]
+        for p in points:
+            payload = dict(p.payload or {})
+            meta = dict(payload.get("metadata") or {})
+            meta.update(extra_meta)
+            payload["metadata"] = meta
+            client.set_payload(name, payload=payload, points=[p.id])
+    except Exception:
+        pass  # best-effort，标签失败不影响主链路

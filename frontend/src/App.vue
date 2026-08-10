@@ -2,6 +2,7 @@
 import { ref, onMounted } from 'vue'
 import ChatView from './components/ChatView.vue'
 import DocListView from './components/DocListView.vue'
+import AgentWorkbench from './components/AgentWorkbench.vue'
 import { listConversations, deleteConversation } from './api.js'
 
 const tab = ref('chat')
@@ -78,6 +79,7 @@ onMounted(load)
       <nav class="nav-tabs">
         <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">💬 对话</button>
         <button :class="{ active: tab === 'docs' }" @click="tab = 'docs'">📚 知识库</button>
+        <button :class="{ active: tab === 'workbench' }" @click="tab = 'workbench'">🛠 工作台</button>
       </nav>
       <div class="side-foot">
         <span class="dot"></span>服务运行中 · 对话保留本地
@@ -93,6 +95,7 @@ onMounted(load)
         @updated="onUpdated"
       />
       <DocListView v-show="tab === 'docs'" />
+      <AgentWorkbench v-show="tab === 'workbench'" />
     </main>
   </div>
 </template>

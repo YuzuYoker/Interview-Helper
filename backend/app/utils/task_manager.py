@@ -58,6 +58,20 @@ def _cleanup() -> None:
         _tasks.pop(did, None)
 
 
+def _auto_tag_document(document_id: str, filename: str, chunks) -> None:
+    """上传完成后后台为文档生成标签（best-effort，失败不影响主链路）。"""
+    try:
+        from app.agent.tools import build_tools
+
+        tool = next((t for t in build_tools() if t.name == "auto_tag"), None)
+        if tool is None:
+            return
+        preview = "".join(c.page_content for c in chunks[:3])[:1200]
+        tool.invoke({"filename": filename, "content_preview": preview, "doc_id": document_id})
+    except Exception:
+        pass
+
+
 def submit_upload(document_id: str, save_path: Path, filename: str) -> dict:
     """提交上传任务：任务体 = 原同步流水线（加载→分块→向量化→入库）。"""
     with _lock:
@@ -101,6 +115,14 @@ def submit_upload(document_id: str, save_path: Path, filename: str) -> dict:
 
             bm25_index.invalidate()  # 新文档入库后重建 BM25 索引
             incr_kv()  # 知识版本号 +1 → 缓存全部失效
+
+            # Agent 模式：后台生成标签/关键词/摘要写入 payload（不阻塞上传状态）
+            if settings.agent_enabled:
+                threading.Thread(
+                    target=_auto_tag_document,
+                    args=(document_id, filename, chunks),
+                    daemon=True,
+                ).start()
 
             with _lock:
                 state.update(

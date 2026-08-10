@@ -1,4 +1,5 @@
-"""SSE 流式接口验证：断言事件顺序 sources → delta* → done，中文完整。
+"""SSE 流式接口验证：兼容 Agent 事件（thought/tool_call/tool_result 前置），
+断言 sources → delta* → done 契约与中文完整性。
 
 用法：先启动 uvicorn，再运行
     python backend/scripts/test_stream.py
@@ -35,26 +36,26 @@ def main() -> None:
             events[-1] = (events[-1][0], json.loads(line[6:]))
 
     names = [e[0] for e in events]
-    assert names[0] == "sources", f"首个事件应为 sources: {names}"
-    assert all(n == "delta" for n in names[1:-1]), f"中间应为 delta*: {names}"
     assert names[-1] == "done", f"末尾应为 done: {names}"
-    assert len(names) >= 3, "至少应有 sources + 1 delta + done"
+    assert "error" not in names, f"不应出现 error: {names}"
+    assert "sources" in names, f"应出现 sources 事件: {names}"
 
-    sources = events[0][1]["sources"]
+    # Agent 模式下 sources 可多次累积（每次检索后全量发出）→ 取最后一次
+    sources = [e[1]["sources"] for e in events if e[0] == "sources"][-1]
     assert sources, "sources 不应为空"
     done = events[-1][1]
     answer = done["answer"]
-    # 引用编号从检索到的 sources 序号起算：若用户库有文档占据 [1]..[n]，
-    # 参考库命中从 [n+1] 起标——不能死板要求 "[1]"，改为校验存在任意 [n]
+    # 引用编号从检索到的 sources 序号起算：不能死板要求 "[1]"，改为校验存在任意 [n]
     assert re.search(r"\[\d+\]", answer), "回答应含引用标注 [n]"
     assert done["source_count"] == len(sources)
+    assert isinstance(done.get("tool_trace", []), list), "done 应携带 tool_trace"
 
-    # 中文完整性：delta 拼接应等于 done 的完整回答
-    streamed = "".join(e[1]["content"] for e in events[1:-1])
+    # 中文完整性：delta 拼接应等于 done 的完整回答（工具轮 DeepSeek content 为空，不污染）
+    streamed = "".join(e[1]["content"] for e in events if e[0] == "delta")
     assert streamed == answer, "流式拼接与完整回答不一致"
 
-    print(f"[ok] 事件顺序: {' → '.join(names[:3])} … → {names[-1]}")
-    print(f"[ok] delta 数: {len(events) - 2}, 引用数: {len(sources)}")
+    print(f"[ok] 事件顺序: {' → '.join(names[:5])} … → {names[-1]}")
+    print(f"[ok] delta 数: {sum(1 for n in names if n == 'delta')}, 引用数: {len(sources)}")
     print(f"[ok] 回答开头: {answer[:80]}…")
     print("[ok] SSE 流式验证通过 ✅")
 

@@ -37,7 +37,7 @@
 - ⚡ **流式输出**：SSE 打字机效果
 - 💬 **多轮对话**：Query 改写自动补全指代（"那公司压价怎么办？"→ 命中谈薪资料）；回答生成注入最近对话历史，衔接前文
 - 💾 **会话本地持久化**：SQLite 落库（`backend/data/conversations.db`），左侧会话栏切换历史对话（参考 DeepSeek 官网），刷新/重开保留完整上下文与引用
-- 🌐 **联网搜索（Fetch MCP Server）**：输入框「🌐 联网搜索」开关或时效敏感词自动触发（最新/今年/趋势/行情/天气…，问题带 http(s):// 链接也自动触发）——Bing 搜最新网页 → fetch MCP server 抓正文 → 与知识库合并引用（🌐 卡片带原文链接），**无 API key**。天气问句自动规范为"<城市>天气预报"保证命中天气站；直接发链接则抓该网页内容
+- 🌐 **联网搜索（Fetch MCP Server）**：Agent 模式下由 LLM 通过 `web_search`/`fetch_url` 工具自主决定（系统提示引导时效/天气/链接场景；输入框「🌐 联网搜索」开关仅作提示）——Bing 搜最新网页 → fetch MCP server 抓正文 → 与知识库合并引用（🌐 卡片带原文链接），**无 API key**。天气问句自动规范为"<城市>天气预报"保证命中天气站；直接发链接则抓该网页内容
 - 🚀 **性能优化**：Redis 回答缓存（命中 <50ms，加速 2000x）、异步向量化上传（202 立即返回）、滑动窗口限流
 - 🐳 **一键部署**：docker compose 三服务（后端 + Qdrant + Redis），空库自动 seed
 
@@ -47,6 +47,12 @@
 
 ```
 浏览器 (Vue3) ──► FastAPI (8000)
+                    ├─ Agent 层（backend/app/agent/，AGENT_ENABLED=true 默认）
+                    │    ├─ engine.py      # langchain.agents.create_agent 官方装配（ReAct 循环）
+                    │    ├─ tools.py       # 17 个官方 StructuredTool（检索/联网/记忆/文档/系统）
+                    │    ├─ middleware.py  # langchain.agents.middleware（记忆注入/日志）
+                    │    ├─ streaming.py   # astream → SSE（thought/tool_call/tool_result/sources/delta/done）
+                    │    └─ memory/        # 长期记忆 SQLite 事实表；短期=会话历史注入
                     ├─ Redis 缓存层（回答缓存 + 知识版本号失效，只随用户库变化）
                     ├─ Qdrant 双集合
                     │    ├─ kb_references 面试 skill 参考（只读种子）
@@ -58,8 +64,8 @@
                     ├─ DeepSeek LLM（回答生成）
                     └─ Qwen-VL-Max（图片 OCR）
 
-检索流程：用户库按文档聚合（相关文档 chunk 全量，排最前；按最佳 chunk 相似度排序，避免多块弱相关文档以数量碾压单块精准命中文档） + 参考库双路(RRF+Reranker) top_k
-对话流程：服务端权威历史（读库）→ 检索 → 生成 → 用户/助手消息落库，多会话切换
+Agent 流程：LLM 通过工具自主决策（检索/联网/改写/记忆…），官方循环执行工具、结果回送，直至输出答案 → SSE 流式推送 + tool_trace
+对话流程：服务端权威历史（读库）→ Agent → 用户/助手消息落库，多会话切换
 ```
 
 ---
@@ -70,10 +76,12 @@
 ProgramRAG/
 ├── backend/                  # FastAPI 后端
 │   ├── app/
-│   │   ├── api/              # 路由：chat / documents / conversations / health
+│   │   ├── api/              # 路由：chat / documents / conversations / health / agent 工作台
+│   │   ├── agent/            # Agent 层：engine(create_agent) / tools(17 工具) / middleware / streaming / memory
 │   │   ├── rag/              # 检索/生成/联网搜索核心
+│   │   ├── prompt/           # 提示词模板加载（backend/prompts/*.prompt）
 │   │   ├── models/           # Pydantic 模型
-│   │   ├── utils/            # 配置 / Redis 缓存 / 限流 / embedding
+│   │   ├── utils/            # 配置 / Redis 缓存 / 限流 / embedding / memories
 │   │   └── main.py           # 入口（lifespan 预热模型 + 静态托管前端 dist）
 │   ├── scripts/              # seed_knowledge.py / smoke_test.py / eval_retrieval.py…
 │   ├── data/                 # qdrant / uploads / conversations.db（运行时生成）
@@ -355,7 +363,7 @@ python backend/scripts/smoke_test.py
 | 上传 | 拖一个 PDF/简历进「知识库」 | 202 立即返回，处理完出现在列表，提问优先引用它 |
 | 多轮 | 追问"那公司压价怎么办？" | 理解指代，命中谈薪资料 |
 | 会话 | 刷新页面 | 左侧会话栏仍在，上下文保留 |
-| 联网 | 打开「🌐 联网搜索」问"2026 年 Java 薪资行情"；再问"杭州天气如何？" | 回答带 🌐 原文链接卡片；天气问句不用开关自动联网 |
+| 联网 | 问"2026 年 Java 薪资行情"或"杭州天气如何？" | Agent 下 LLM 自主调用 `web_search`/`fetch_url`，回答带 🌐 原文链接卡片（「🌐 联网搜索」开关仅作提示） |
 
 ---
 
@@ -380,9 +388,10 @@ python backend/scripts/smoke_test.py
 | `ENABLE_BM25` / `ENABLE_RERANKER` | true | 混合检索/精排开关 |
 | `RATE_LIMIT_CHAT_PER_MIN` | 10 | /api/chat 与 stream 限额 |
 | `RATE_LIMIT_UPLOAD_PER_MIN` | 5 | 上传限额 |
+| `AGENT_ENABLED` | true | 主开关：true 走 Agent（LLM 工具决策）；false 回退传统 RAG（回归对照） |
 | `WEB_SEARCH_ENABLED` | true | 联网搜索总开关 |
 | `WEB_FETCH_COMMAND` | `python -m mcp_server_fetch` | fetch MCP server 启动命令（解析为当前解释器；不用 uvx——它装 mcp 2.x 与 fetch 不兼容） |
-| `WEB_SEARCH_AUTO` | true | 问题含时效敏感词（最新/今年/趋势/天气…）或 http(s):// 链接时自动触发 |
+| `WEB_SEARCH_AUTO` | true | 仅作用于旧 RAG 路径（`AGENT_ENABLED=false`）：问题含时效敏感词时自动触发。Agent 模式下联网完全由 LLM 通过 `web_search`/`fetch_url` 工具自主决定 |
 | `WEB_SEARCH_MAX_PAGES` | 3 | 抓取正文的网页数 |
 | `WEB_SEARCH_TIMEOUT` | 20 | 单次搜索+抓取整体超时（秒） |
 
@@ -397,12 +406,17 @@ python backend/scripts/smoke_test.py
 | GET | `/api/documents/{id}/status` | 后台任务状态轮询 |
 | GET | `/api/documents` | 文档列表 |
 | DELETE | `/api/documents/{id}` | 删除（处理中返回 409） |
-| POST | `/api/chat` | 问答（响应头 `X-Cache: HIT/MISS`，带 `conversation_id` 则读库取历史并落库；`web_search: true` 或时效敏感词触发联网） |
-| POST | `/api/chat/stream` | SSE 流式问答（sources → delta* → done，同样支持会话落库与联网搜索） |
+| POST | `/api/chat` | 问答（响应头 `X-Cache: HIT/MISS`，带 `conversation_id` 则读库取历史并落库；Agent 下 `web_search` 仅作联网 hint） |
+| POST | `/api/chat/stream` | SSE 流式问答（Agent 下：thought/tool_call/tool_result → sources → delta* → done，`done` 带 `tool_trace`；同样支持会话落库与联网搜索） |
 | GET | `/api/conversations` | 会话列表（左侧栏） |
 | POST | `/api/conversations` | 新建会话 |
 | GET | `/api/conversations/{id}` | 会话详情（含全部消息与引用） |
 | DELETE | `/api/conversations/{id}` | 删除会话 |
+| GET/POST/DELETE | `/api/agent/memories` | 长期记忆（Agent 工作台）CRUD 与统计 |
+| GET | `/api/agent/tools` | 17 个工具的名称/描述/参数 schema（工作台） |
+| GET | `/api/agent/prompts` | 提示词模板列表（工作台） |
+| GET | `/api/agent/middleware` | 中间件清单（工作台） |
+| GET | `/api/agent/metrics` | 性能指标 + 记忆统计（工作台） |
 
 ---
 
@@ -441,7 +455,7 @@ python backend/scripts/smoke_test.py
 **联网搜索**
 
 - **联网搜索要 API key 吗？** 不需要。后端作为 MCP 客户端连接 fetch MCP server（`mcp-server-fetch`），搜索走 Bing 结果页解析（curl_cffi 模拟 Chrome 指纹绕过反爬——Docker 容器里裸 httpx 会被判 bot 返回验证码页），正文抓取走 fetch 工具（readability 提取）
-- **怎么触发联网？** 输入框「🌐 联网搜索」开关强制联网；或问题含"最新/今年/趋势/行情/天气"等时效敏感词、或带 http(s):// 链接时自动触发（`WEB_SEARCH_AUTO=false` 关闭自动）。问题带链接直接抓该网页；天气问句自动规范为"<城市>天气预报"（Bing 对口语问句易返回百科/攻略而非天气站）。联网回答带 🌐 来源卡片（可点原文链接），缓存 key 含搜索结果哈希，联网/不联网互不污染
+- **怎么触发联网？** Agent 模式（默认）下由 LLM 自主决定——系统提示引导"时效/天气/链接"场景，LLM 判断需要时调用 `web_search`/`fetch_url` 工具；输入框「🌐 联网搜索」开关仅作系统提示 hint（不强制）。旧 RAG 路径（`AGENT_ENABLED=false`）仍按开关/时效敏感词自动触发（`WEB_SEARCH_AUTO`）。问题带链接 LLM 会直接抓该网页；天气问句自动规范为"<城市>天气预报"（Bing 对口语问句易返回百科/攻略而非天气站）。联网回答带 🌐 来源卡片（可点原文链接），缓存 key 含搜索结果哈希，联网/不联网互不污染
 - **Docker 里模型从哪来**：本仓库 compose 默认绑定宿主 HF 缓存；首次部署按 4.5 改 named volume + 预下载（`hf-cache` 卷持久化，只需一次）
 
 **其他**

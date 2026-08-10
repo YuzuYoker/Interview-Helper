@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS conversations(
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    summary TEXT
 );
 CREATE TABLE IF NOT EXISTS messages(
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,10 +35,27 @@ CREATE TABLE IF NOT EXISTS messages(
     role TEXT NOT NULL,
     content TEXT NOT NULL DEFAULT '',
     sources TEXT NOT NULL DEFAULT '[]',
+    tool_trace TEXT NOT NULL DEFAULT '[]',
     ts TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_id, seq);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """幂等迁移：旧库已有表时 CREATE TABLE IF NOT EXISTS 不会补列，需手动 ALTER。
+
+    - messages.tool_trace：Agent 工具调用轨迹（SSE tool_call/tool_result 序列 JSON）
+    - conversations.summary：会话总结（summarize_conversation 落库）
+    """
+    msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    if "tool_trace" not in msg_cols:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN tool_trace TEXT NOT NULL DEFAULT '[]'"
+        )
+    conv_cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)").fetchall()}
+    if "summary" not in conv_cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN summary TEXT")
 
 
 def _db() -> Path:
@@ -50,6 +68,7 @@ def _db() -> Path:
             conn = sqlite3.connect(str(_db_path))
             try:
                 conn.executescript(_SCHEMA)
+                _migrate(conn)
             finally:
                 conn.close()
         _initialized.add(_db_path)
@@ -111,15 +130,16 @@ def list_conversations() -> list[dict]:
 
 
 def get_conversation(cid: str) -> dict | None:
-    """会话详情（含全部消息，assistant 消息带 sources 引用）。"""
+    """会话详情（含全部消息，assistant 消息带 sources 引用 + tool_trace 轨迹）。"""
     with _tx() as conn:
         row = conn.execute(
-            "SELECT id, title, created_at, updated_at FROM conversations WHERE id=?", (cid,)
+            "SELECT id, title, created_at, updated_at, summary FROM conversations WHERE id=?",
+            (cid,),
         ).fetchone()
         if row is None:
             return None
         msgs = conn.execute(
-            "SELECT role, content, sources, ts FROM messages WHERE conv_id=? ORDER BY seq",
+            "SELECT role, content, sources, tool_trace, ts FROM messages WHERE conv_id=? ORDER BY seq",
             (cid,),
         ).fetchall()
     return {
@@ -129,6 +149,7 @@ def get_conversation(cid: str) -> dict | None:
                 "role": m["role"],
                 "content": m["content"],
                 "sources": json.loads(m["sources"]) if m["sources"] else [],
+                "tool_trace": json.loads(m["tool_trace"]) if m["tool_trace"] else [],
                 "ts": m["ts"],
             }
             for m in msgs
@@ -145,13 +166,27 @@ def get_history(cid: str) -> list[dict]:
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
 
-def append_message(cid: str, role: str, content: str, sources: list | None = None) -> None:
-    """追加消息；首条用户消息自动把标题换成问题摘要。"""
+def append_message(
+    cid: str,
+    role: str,
+    content: str,
+    sources: list | None = None,
+    tool_trace: list | None = None,
+) -> None:
+    """追加消息；首条用户消息自动把标题换成问题摘要（LLM 标题后续覆盖）。"""
     now = _now()
     with _tx() as conn:
         conn.execute(
-            "INSERT INTO messages(conv_id, role, content, sources, ts) VALUES(?,?,?,?,?)",
-            (cid, role, content, json.dumps(sources or [], ensure_ascii=False), now),
+            "INSERT INTO messages(conv_id, role, content, sources, tool_trace, ts) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                cid,
+                role,
+                content,
+                json.dumps(sources or [], ensure_ascii=False),
+                json.dumps(tool_trace or [], ensure_ascii=False),
+                now,
+            ),
         )
         conn.execute(
             "UPDATE conversations SET updated_at=? WHERE id=?", (now, cid)
@@ -164,6 +199,24 @@ def append_message(cid: str, role: str, content: str, sources: list | None = Non
                 conn.execute(
                     "UPDATE conversations SET title=? WHERE id=?", (_make_title(content), cid)
                 )
+
+
+def update_conversation_title(cid: str, title: str) -> None:
+    """更新会话标题（LLM 自动生成标题时调用）。"""
+    title = " ".join((title or "").split())
+    if not title:
+        return
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE conversations SET title=?, updated_at=? WHERE id=?",
+            (_make_title(title, limit=30), _now(), cid),
+        )
+
+
+def update_conversation_summary(cid: str, summary: str) -> None:
+    """写入会话总结（summarize_conversation）。"""
+    with _tx() as conn:
+        conn.execute("UPDATE conversations SET summary=? WHERE id=?", (summary, cid))
 
 
 def delete_conversation(cid: str) -> bool:

@@ -197,32 +197,6 @@ def _fetch_bing_html(url: str) -> str:
         return ""
 
 
-# 天气搜索词规范化：Bing 对带口语词（如何/今天/实时）的"X天气"问句常返回城市
-# 百科/攻略等泛结果而非天气站；裸词"X天气/天气预报"稳定命中天气站（实测
-# "杭州天气"→7/8 天气站，"杭州天气如何"→0/8）。命中即重写为 "<城市>天气预报"。
-_WEATHER_NOISE = re.compile(
-    r"[如何怎么样怎样是否什么多少今天现在实时未来明天本周周末这几天的了吗呢吧？！?。，、\s]+"
-)
-_WEATHER_CITY = re.compile(r"([一-龥]{2,6})天气")
-
-
-def optimize_search_query(query: str) -> str:
-    """搜索词规范化：仅针对天气类（Bing 对天气问句表达极其敏感）。
-
-    例："杭州天气如何？" → "杭州天气预报"；"北京的天气怎么样" → "北京天气预报"。
-    无天气信号/无法提取城市时原样返回（不动其它查询，避免误伤）。
-    """
-    if "天气" not in query:
-        return query
-    m = _WEATHER_CITY.search(query)
-    if not m:
-        return query
-    city = _WEATHER_NOISE.sub("", m.group(1))
-    if 2 <= len(city) <= 4:  # 城市 2-4 字（地级市/县级市）
-        return f"{city}天气预报"
-    return query
-
-
 def search_bing(query: str) -> list[WebItem]:
     """抓 Bing 结果页 → 解析 b_algo 块取直链结果。失败返回空。"""
     url = BING_URL.format(q=quote(query))

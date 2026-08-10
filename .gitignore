@@ -13,3 +13,4 @@ torch-2.9.1+cpu*.whl
 .claude/settings.json
 .claude/settings.local.json
 docs/
+shopkeeper-agent/

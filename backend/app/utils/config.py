@@ -66,6 +66,17 @@ class Settings(BaseSettings):
     # 生成
     max_tokens: int = 1024  # 防长回答失控
 
+    # ---- Agent（ReAct / tool-calling 循环）----
+    agent_enabled: bool = True  # 主开关：True 走 Agent 循环；False 回退传统 RAG（回归对照）
+    agent_max_rounds: int = 6  # ReAct 循环最大决策轮次（LLM 工具调用轮）
+    agent_max_retries: int = 2  # 单工具瞬时错误重试次数
+    agent_timeout: int = 120  # 单次 Agent 运行整体超时（秒）
+    agent_thought_enabled: bool = True  # 是否发 thought SSE 事件（仅状态行，非原始 CoT）
+    agent_title_auto: bool = True  # 首条消息后自动生成会话标题（LLM）
+    agent_compress_threshold: int = 20  # 历史消息数超过此值 → 压缩早期对话为摘要
+    agent_plan_enabled: bool = True  # 注册 plan_tasks 工具 + 启用 Plan-and-Execute
+    agent_trace_enabled: bool = True  # 是否把 tool_trace JSON 持久化到 SQLite messages
+
     # 缓存（Redis）
     redis_url: str = ""  # 空 = 禁用缓存；如 redis://localhost:6379/0
     cache_ttl: int = 900  # 回答缓存 TTL（秒），与知识版本号双保险

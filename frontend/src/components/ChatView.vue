@@ -16,7 +16,8 @@ const fileInput = ref(null)
 const attachments = ref([]) // { name, status: 'uploading'|'done'|'err', message }
 const uploadedCount = ref(0) // 本次对话已提交文件数（上限 5）
 const convId = ref(props.conversationId)
-const webOn = ref(false) // 「🌐 联网搜索」开关（DeepSeek 同款；后端另有敏感词自动触发）
+const webOn = ref(false) // 「🌐 联网搜索」开关（Agent 模式下仅作系统提示 hint，是否联网由 LLM 决策）
+const lastQuestion = ref('') // 重试用：记住最近一次问题
 let controller = null
 
 // ---- 上传限制：每对话 ≤5 个文件，单个 ≤10MB ----
@@ -30,13 +31,37 @@ async function loadConversation() {
   try {
     const conv = await getConversation(props.conversationId)
     convId.value = conv.id
-    messages.value = (conv.messages || []).map((m) => ({
-      role: m.role,
-      text: m.content,
-      sources: m.sources || [],
-      status: 'done', // 历史消息都是已完成状态，不再显示生成胶囊
-      error: '',
-    }))
+    messages.value = (conv.messages || []).map((m) => {
+      // 历史消息带 tool_trace → 重建工具卡片（tool_call/tool_result 配对）
+      const toolCalls = []
+      ;(m.tool_trace || []).forEach((entry) => {
+        if (entry.type === 'tool_call') {
+          toolCalls.push({
+            id: entry.tool_call_id,
+            name: entry.name,
+            args: entry.args || {},
+            status: 'done',
+            summary: '',
+          })
+        } else if (entry.type === 'tool_result') {
+          const card = toolCalls.find((c) => c.id === entry.tool_call_id)
+          if (card) {
+            card.status = entry.ok ? 'done' : 'error'
+            card.summary = entry.summary || ''
+          }
+        }
+      })
+      return {
+        role: m.role,
+        text: m.content,
+        sources: m.sources || [],
+        status: 'done', // 历史消息都是已完成状态，不再显示生成胶囊
+        error: '',
+        thoughts: [],
+        toolCalls,
+        retryable: false,
+      }
+    })
   } catch (e) {
     console.error('加载会话失败', e)
   }
@@ -143,6 +168,7 @@ async function send() {
   const question = input.value.trim()
   if (!question || streaming.value) return
   input.value = ''
+  lastQuestion.value = question // 记录最近问题，失败可重试
 
   // 新对话：先建会话拿 id（失败则无持久化，本次对话仍可继续）
   if (!convId.value) {
@@ -163,6 +189,9 @@ async function send() {
     sources: [],
     status: webOn.value ? 'web_search' : 'pending',
     error: '',
+    thoughts: [], // Agent 思考过程（thought 事件）
+    toolCalls: [], // Agent 工具调用卡片（tool_call/tool_result 事件）
+    retryable: false,
   }
   messages.value.push(assistant)
   // 必须从响应式数组取代理引用——直接持有原始对象，修改属性不触发视图更新
@@ -185,7 +214,23 @@ async function send() {
         const payload = JSON.parse(data)
         // 事件回调里统一从响应式数组取 proxy 引用——sources/status 必须走代理才能触发视图更新
         currentMsg = messages.value[messages.value.length - 1]
-        if (event === 'sources') {
+        if (event === 'thought') {
+          currentMsg.thoughts.push(payload.message)
+        } else if (event === 'tool_call') {
+          currentMsg.toolCalls.push({
+            id: payload.tool_call_id,
+            name: payload.name,
+            args: payload.args || {},
+            status: 'running',
+            summary: '',
+          })
+        } else if (event === 'tool_result') {
+          const card = currentMsg.toolCalls.find((c) => c.id === payload.tool_call_id)
+          if (card) {
+            card.status = payload.ok ? 'done' : 'error'
+            card.summary = payload.summary || ''
+          }
+        } else if (event === 'sources') {
           currentMsg.sources = payload.sources
           currentMsg.status = 'streaming' // 检索完成 → 生成中
           scrollToBottom()
@@ -196,6 +241,9 @@ async function send() {
           // 保证已收到所有 delta（rAF 可能尚未 flush）
           currentMsg.text = payload.answer
           currentMsg.status = 'done'
+          currentMsg.toolTrace = payload.tool_trace || []
+          // 收尾仍为 running 的卡片（个别工具可能无 tool_result）
+          currentMsg.toolCalls.forEach((c) => { if (c.status === 'running') c.status = 'done' })
           if (rafId) { cancelAnimationFrame(rafId); rafId = null }
           pending = ''
         } else if (event === 'error') {
@@ -211,6 +259,7 @@ async function send() {
     } else {
       m.status = 'error'
       m.error = e.message || String(e)
+      m.retryable = true // 支持重试
     }
   } finally {
     if (rafId) { cancelAnimationFrame(rafId); rafId = null }
@@ -225,6 +274,21 @@ async function send() {
 
 function stop() {
   if (controller) controller.abort()
+}
+
+// 重试失败的回答：移除"失败回答 + 其用户消息"，重新发送同一问题
+async function sendText(question) {
+  input.value = question
+  await send()
+}
+
+async function retry(failedMsg) {
+  const idx = messages.value.indexOf(failedMsg)
+  if (idx < 0) return
+  messages.value.splice(Math.max(0, idx - 1)) // 移除失败回答与对应的用户消息，避免重复
+  if (controller) { controller.abort(); controller = null }
+  streaming.value = false
+  if (lastQuestion.value) await sendText(lastQuestion.value)
 }
 
 function onKeydown(e) {
@@ -248,7 +312,7 @@ onBeforeUnmount(() => {
           <div class="sub">上传你的简历/面经，问任何面试问题 —— 回答带引用溯源</div>
           <div class="sub" style="margin-top:4px">试试：「行为面试怎么准备？」「根据我的简历，我的核心优势是什么？」</div>
         </div>
-        <MessageBubble v-for="(m, i) in messages" :key="i" :message="m" />
+        <MessageBubble v-for="(m, i) in messages" :key="i" :message="m" @retry="retry(m)" />
       </div>
     </div>
 

@@ -20,6 +20,7 @@ class MessageInfo(BaseModel):
     role: Literal["user", "assistant"]
     content: str
     sources: list[dict] = []  # assistant 消息的引用溯源（用户消息为空）
+    tool_trace: list[dict] = []  # assistant 消息的 Agent 工具调用轨迹（tool_call/tool_result）
     ts: str
 
 
@@ -28,4 +29,5 @@ class ConversationDetail(BaseModel):
     title: str
     created_at: str
     updated_at: str
+    summary: Optional[str] = None  # 会话总结（summarize_conversation 落库）
     messages: list[MessageInfo]
