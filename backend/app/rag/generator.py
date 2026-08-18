@@ -356,9 +356,9 @@ async def stream_agent_cached(
             yield _replay_trace_event(entry)
         yield ("sources", {"sources": cached.get("sources", [])})
         answer = cached["answer"]
-        for i in range(0, len(answer), 2):  # 切小块模拟打字机
-            yield ("delta", {"content": answer[i : i + 2]})
-            await asyncio.sleep(0.003)
+        for i in range(0, len(answer), 6):  # 切小块模拟打字机（与 streaming.py 同节奏）
+            yield ("delta", {"content": answer[i : i + 6]})
+            await asyncio.sleep(0.025)
         yield ("done", {
             "answer": answer,
             "source_count": len(cached.get("sources", [])),
@@ -430,9 +430,9 @@ async def stream_answer_cached(
     if cached is not None:
         yield ("sources", {"sources": cached.get("sources", [])})
         answer = cached["answer"]
-        for i in range(0, len(answer), 2):  # 切小块模拟打字机
-            yield ("delta", {"content": answer[i : i + 2]})
-            await asyncio.sleep(0.003)
+        for i in range(0, len(answer), 6):  # 切小块模拟打字机（与 streaming.py 同节奏）
+            yield ("delta", {"content": answer[i : i + 6]})
+            await asyncio.sleep(0.025)
         yield ("done", {"answer": answer, "source_count": len(cached.get("sources", []))})
         return
 

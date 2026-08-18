@@ -53,11 +53,12 @@ async def stream_agent(
 
         if mode == "messages":
             msg, _meta = data
-            if getattr(msg, "type", "") == "ai":
+            if getattr(msg, "type", "") == "ai" and not getattr(msg, "tool_calls", None):
+                # 只收集最终回答文本（带 tool_calls 的中间决策消息跳过）；
+                # create_agent 对 OpenAI 兼容模型整段返回，收尾时统一切块模拟打字机
                 text = getattr(msg, "content", "") or ""
                 if text:
                     deltas.append(text)
-                    yield ("delta", {"content": text})
 
         elif mode == "updates":
             for node, update in (data or {}).items():
@@ -90,13 +91,22 @@ async def stream_agent(
                         data_sources = ((artifact.get("data") or {}).get("sources")) or []
                         sources.extend(data_sources)
 
-    # 收尾：全局编号 + sources + done
+    # 收尾：全局编号 sources + 切块模拟打字机 + done
     for i, s in enumerate(sources, 1):
         s["index"] = i
     answer = "".join(deltas)
+    if not answer:
+        answer = "知识库中暂无相关信息。"
     yield ("sources", {"sources": sources})
+    # create_agent 对 OpenAI 兼容模型整段返回 → 按小块+间隔逐块推 SSE，
+    # 前端 rAF 每帧消费 → 视觉上逐字打字机。
+    # 节奏：每块 6 字、间隔 25ms ≈ 240 字/秒；1000 字约 4s 打完，过长回答也保持
+    # 合理总时长（3000 字约 12.5s），网络缓冲合并后仍有明显分帧感。
+    for i in range(0, len(answer), 6):
+        yield ("delta", {"content": answer[i : i + 6]})
+        await asyncio.sleep(0.025)
     yield ("done", {
-        "answer": answer or "知识库中暂无相关信息。",
+        "answer": answer,
         "source_count": len(sources),
         "tool_trace": tool_trace,
     })
