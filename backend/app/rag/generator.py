@@ -227,11 +227,12 @@ def build_agent_answer_cached(
     history: list[dict] | None = None,
     top_k: int | None = None,
     web_hint: bool = False,
+    bypass_cache: bool = False,
 ) -> tuple[ChatResponse, bool]:
     """Agent 非流式 + 缓存：命中返回 (response, True)。
 
     web_hint 仅作系统提示 hint（完全由 LLM 决定是否联网）；缓存 key 并入 web_hint
-    与工具轨迹，联网/不联网回答互不污染。
+    与工具轨迹，联网/不联网回答互不污染。bypass_cache=True（重新生成）跳过读缓存。
     """
     import time as _time
 
@@ -239,7 +240,7 @@ def build_agent_answer_cached(
 
     k = top_k or settings.top_k
     start = _time.monotonic()
-    cached = get_agent_cached(question, history, k, web_hint)
+    cached = None if bypass_cache else get_agent_cached(question, history, k, web_hint)
     if cached is not None:
         _record_metric(cache_hit=True, total_ms=round((_time.monotonic() - start) * 1000, 1))
         sources = [Source(**s) for s in cached.get("sources", [])]
@@ -272,19 +273,24 @@ def build_answer_cached(
     history: list[dict] | None = None,
     top_k: int | None = None,
     web_search: bool = False,
+    bypass_cache: bool = False,
 ) -> tuple[ChatResponse, bool]:
     """带缓存：agent_enabled 走 Agent 循环，否则回退传统 RAG（web_search 作为开关）。
 
-    返回值与旧签名兼容：(ChatResponse, is_hit)。
+    返回值与旧签名兼容：(ChatResponse, is_hit)。bypass_cache=True（重新生成）跳过读缓存。
     """
     if settings.agent_enabled:
-        return build_agent_answer_cached(question, history, top_k, web_hint=web_search)
+        return build_agent_answer_cached(
+            question, history, top_k, web_hint=web_search, bypass_cache=bypass_cache
+        )
 
     from app.utils.cache import get_cached_answer, set_cached_answer
 
     k = top_k or settings.top_k
     web_items, web_hash = _resolve_web_legacy(question, web_search)
-    cached = get_cached_answer(question, history, k, bool(web_items), web_hash)
+    cached = None if bypass_cache else get_cached_answer(
+        question, history, k, bool(web_items), web_hash
+    )
     if cached is not None:
         sources = [Source(**s) for s in cached.get("sources", [])]
         return ChatResponse(answer=cached["answer"], sources=sources), True
@@ -335,11 +341,13 @@ async def stream_agent_cached(
     top_k: int | None,
     web_hint: bool = False,
     conv_id: str | None = None,
+    bypass_cache: bool = False,
 ) -> AsyncIterator[tuple[str, dict]]:
     """Agent 流式 + 缓存：SSE 事件协议含 thought/tool_call/tool_result。
 
     命中回放：thought(命中) → tool_trace 逐条 → sources → 打字机 delta → done；
     未命中：跑 stream_agent，done 时写入 agent 缓存。
+    bypass_cache=True（重新生成）跳过读缓存，保证真的重新生成而不是回放旧答案。
     """
     import asyncio
     import time as _time
@@ -348,7 +356,7 @@ async def stream_agent_cached(
 
     k = top_k or settings.top_k
     start = _time.monotonic()
-    cached = get_agent_cached(question, history, k, web_hint)
+    cached = None if bypass_cache else get_agent_cached(question, history, k, web_hint)
     if cached is not None:
         _record_metric(cache_hit=True, total_ms=round((_time.monotonic() - start) * 1000, 1))
         yield ("thought", {"type": "info", "message": "命中缓存，回放上一次处理过程"})
@@ -407,15 +415,17 @@ async def stream_answer_cached(
     history: list[dict] | None,
     top_k: int | None,
     web_search: bool = False,
+    bypass_cache: bool = False,
 ) -> AsyncIterator[tuple[str, dict]]:
     """带缓存的流式：agent_enabled 走 Agent 循环（含 thought/tool_call 事件），
     否则回退传统 RAG（前端零改动）。
 
     缓存命中时回放：sources → 按 2 字切 delta（3ms 间隔，保留打字机效果）→ done。
+    bypass_cache=True（重新生成）跳过读缓存。
     """
     if settings.agent_enabled:
         async for ev, payload in stream_agent_cached(
-            question, history, top_k, web_hint=web_search
+            question, history, top_k, web_hint=web_search, bypass_cache=bypass_cache
         ):
             yield ev, payload
         return
@@ -426,7 +436,9 @@ async def stream_answer_cached(
 
     k = top_k or settings.top_k
     web_items, web_hash = _resolve_web_legacy(question, web_search)
-    cached = get_cached_answer(question, history, k, bool(web_items), web_hash)
+    cached = None if bypass_cache else get_cached_answer(
+        question, history, k, bool(web_items), web_hash
+    )
     if cached is not None:
         yield ("sources", {"sources": cached.get("sources", [])})
         answer = cached["answer"]

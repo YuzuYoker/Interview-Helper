@@ -1,13 +1,11 @@
 """文档加载器注册表：{扩展名: 加载函数}，加载函数返回 list[Document]。
 
 PDF 按页读取，每页一个 Document（保留页码 metadata，分块后 chunk 继承页码）；
-图片走 DashScope Qwen-VL-Max API 转文字。
+图片统一走 app.rag.analyzer（DeepSeek 多模态，与聊天模型同一 API Key）。
 """
 from typing import Callable
 
 from langchain_core.documents import Document
-
-from app.utils.config import settings
 
 
 def load_pdf(path: str, filename: str) -> list[Document]:
@@ -73,42 +71,10 @@ def load_txt(path: str, filename: str) -> list[Document]:
 
 
 def load_image(path: str, filename: str) -> list[Document]:
-    """图片 OCR：走 DashScope OpenAI 兼容端点调用 qwen-vl-max 转文字。"""
-    import base64
-    import mimetypes
+    """图片识别：走统一的 analyzer（DeepSeek 多模态，不再有独立 OCR 模型）。"""
+    from app.rag.analyzer import analyze_image
 
-    from openai import OpenAI
-
-    if not settings.dashscope_api_key:
-        raise ValueError("DASHSCOPE_API_KEY 未配置，无法识别图片")
-
-    client = OpenAI(
-        api_key=settings.dashscope_api_key,
-        base_url=settings.dashscope_base_url,
-    )
-    mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    resp = client.chat.completions.create(
-        model=settings.vision_model,  # qwen-vl-max
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": "请完整提取图片中的全部文字信息，保留原有层级和格式，不要解释。",
-                    },
-                ],
-            }
-        ],
-        max_tokens=2048,
-    )
-    text = resp.choices[0].message.content or ""
+    text = analyze_image(path, filename)
     return [
         Document(
             page_content=text,
@@ -117,7 +83,7 @@ def load_image(path: str, filename: str) -> list[Document]:
     ]
 
 
-# 注册表：支持的上传类型
+# 注册表：支持的上传类型（图片格式与 DeepSeek Vision 支持范围一致）
 LOADERS: dict[str, Callable[[str, str], list[Document]]] = {
     ".pdf": load_pdf,
     ".docx": load_docx,
@@ -126,6 +92,6 @@ LOADERS: dict[str, Callable[[str, str], list[Document]]] = {
     ".jpg": load_image,
     ".jpeg": load_image,
     ".png": load_image,
-    ".bmp": load_image,
+    ".gif": load_image,
     ".webp": load_image,
 }

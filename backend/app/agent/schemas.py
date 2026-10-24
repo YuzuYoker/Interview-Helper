@@ -27,7 +27,7 @@ class DocumentTags(BaseModel):
 
 class DocumentPlan(BaseModel):
     """文档解析策略。"""
-    type: str = Field(description="pdf / docx / xlsx / txt / image_ocr / unsupported")
+    type: str = Field(description="pdf / docx / xlsx / txt / image / unsupported")
     strategy: str = Field(description="解析策略一句话")
     reason: str = Field(description="选择原因一句话")
 

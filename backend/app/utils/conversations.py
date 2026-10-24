@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS messages(
     content TEXT NOT NULL DEFAULT '',
     sources TEXT NOT NULL DEFAULT '[]',
     tool_trace TEXT NOT NULL DEFAULT '[]',
+    thoughts TEXT NOT NULL DEFAULT '[]',
     ts TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_id, seq);
@@ -46,12 +47,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """幂等迁移：旧库已有表时 CREATE TABLE IF NOT EXISTS 不会补列，需手动 ALTER。
 
     - messages.tool_trace：Agent 工具调用轨迹（SSE tool_call/tool_result 序列 JSON）
+    - messages.thoughts：Agent 思考过程（SSE thought 序列，刷新后仍可展开）
     - conversations.summary：会话总结（summarize_conversation 落库）
     """
     msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
     if "tool_trace" not in msg_cols:
         conn.execute(
             "ALTER TABLE messages ADD COLUMN tool_trace TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "thoughts" not in msg_cols:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN thoughts TEXT NOT NULL DEFAULT '[]'"
         )
     conv_cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)").fetchall()}
     if "summary" not in conv_cols:
@@ -139,7 +145,8 @@ def get_conversation(cid: str) -> dict | None:
         if row is None:
             return None
         msgs = conn.execute(
-            "SELECT role, content, sources, tool_trace, ts FROM messages WHERE conv_id=? ORDER BY seq",
+            "SELECT role, content, sources, tool_trace, thoughts, ts "
+            "FROM messages WHERE conv_id=? ORDER BY seq",
             (cid,),
         ).fetchall()
     return {
@@ -150,6 +157,7 @@ def get_conversation(cid: str) -> dict | None:
                 "content": m["content"],
                 "sources": json.loads(m["sources"]) if m["sources"] else [],
                 "tool_trace": json.loads(m["tool_trace"]) if m["tool_trace"] else [],
+                "thoughts": json.loads(m["thoughts"]) if m["thoughts"] else [],
                 "ts": m["ts"],
             }
             for m in msgs
@@ -166,25 +174,58 @@ def get_history(cid: str) -> list[dict]:
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
 
+def rewind_last_turn(
+    cid: str, expected_question: str | None = None
+) -> tuple[str, list[dict]] | None:
+    """重新生成/重试：删除最后一条 user 消息之后的所有消息。
+
+    返回 (最后一条 user 消息内容, 该消息之前的 role/content 历史)。
+    - 没有 user 消息时返回 None，调用方回退成普通新一轮（兜底旧的异常会话）；
+    - expected_question 与库内最后一条 user 不一致时也返回 None（说明这次请求在
+      落库前就失败了，库里最后一条 user 属于上一轮，不能误删上一轮回答）。
+    删除与历史读取在同一事务内完成，避免前端「先删再生成」出现中间态。
+    """
+    with _tx() as conn:
+        row = conn.execute(
+            "SELECT seq, content FROM messages "
+            "WHERE conv_id=? AND role='user' ORDER BY seq DESC LIMIT 1",
+            (cid,),
+        ).fetchone()
+        if row is None:
+            return None
+        if expected_question is not None and row["content"] != expected_question:
+            return None
+        conn.execute(
+            "DELETE FROM messages WHERE conv_id=? AND seq>?", (cid, row["seq"])
+        )
+        hist = conn.execute(
+            "SELECT role, content FROM messages WHERE conv_id=? AND seq<? ORDER BY seq",
+            (cid, row["seq"]),
+        ).fetchall()
+    return row["content"], [{"role": r["role"], "content": r["content"]} for r in hist]
+
+
 def append_message(
     cid: str,
     role: str,
     content: str,
     sources: list | None = None,
     tool_trace: list | None = None,
+    thoughts: list | None = None,
 ) -> None:
     """追加消息；首条用户消息自动把标题换成问题摘要（LLM 标题后续覆盖）。"""
     now = _now()
     with _tx() as conn:
         conn.execute(
-            "INSERT INTO messages(conv_id, role, content, sources, tool_trace, ts) "
-            "VALUES(?,?,?,?,?,?)",
+            "INSERT INTO messages(conv_id, role, content, sources, tool_trace, thoughts, ts) "
+            "VALUES(?,?,?,?,?,?,?)",
             (
                 cid,
                 role,
                 content,
                 json.dumps(sources or [], ensure_ascii=False),
                 json.dumps(tool_trace or [], ensure_ascii=False),
+                json.dumps(thoughts or [], ensure_ascii=False),
                 now,
             ),
         )

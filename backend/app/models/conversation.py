@@ -21,6 +21,7 @@ class MessageInfo(BaseModel):
     content: str
     sources: list[dict] = []  # assistant 消息的引用溯源（用户消息为空）
     tool_trace: list[dict] = []  # assistant 消息的 Agent 工具调用轨迹（tool_call/tool_result）
+    thoughts: list[str] = []  # assistant 消息的思考过程（刷新后仍可展开）
     ts: str
 
 

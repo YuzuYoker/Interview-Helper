@@ -10,6 +10,7 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[str] = None  # 会话持久化：提供则服务端读库取权威历史并落库
     top_k: int = Field(default=4, ge=1, le=10)
     web_search: bool = False  # 联网搜索开关（前端「🌐 联网搜索」）
+    regenerate: bool = False  # 重新生成/重试：服务端删除最后一条回答并复用已落库的 user 消息
 
 
 class Source(BaseModel):

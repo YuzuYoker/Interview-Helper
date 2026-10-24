@@ -29,7 +29,7 @@
 
 ## 一、功能特性
 
-- 📄 **多格式资料入库**：PDF / Word / Excel / txt / 图片（图片自动走 Qwen-VL-Max OCR 转文字）
+- 📄 **多格式资料入库**：PDF / Word / Excel / txt / 图片（图片由 DeepSeek 多模态模型 `deepseek-flash` 直接识别，无需额外 OCR 服务）
 - 🧩 **双库分离**：`kb_references`（面试 skill 参考，只读种子）+ `kb_documents`（你上传的资料，读写）——系统方法论与个人素材分库，检索互不污染，你的文档稳定命中并优先引用
 - 🎯 **混合检索**：向量检索（BGE 语义）+ BM25 关键词，RRF 融合，Reranker 精排 —— 检索 Hit@1 **92%** / Hit@3 **98%**（50 题评估集，BM25+RRF+Reranker 配置）
 - 📚 **引用溯源**：回答标注 [1][2]，点击展开原文卡片 + 置信度评分（你上传的文档标注 📎 附件并排在最前）
@@ -61,7 +61,7 @@
                     ├─ BM25 关键词索引（内存，jieba 分词，覆盖两库）
                     ├─ Reranker 精排（bge-reranker-v2-m3，参考库双路用）
                     ├─ DeepSeek LLM（回答生成）
-                    └─ Qwen-VL-Max（图片 OCR）
+                    └─ DeepSeek 多模态（图片识别，复用同一 Key/模型）
 
 Agent 流程：LLM 通过工具自主决策（检索/联网/改写/记忆…），官方循环执行工具、结果回送，直至输出答案 → SSE 流式推送 + tool_trace
 对话流程：服务端权威历史（读库）→ Agent → 用户/助手消息落库，多会话切换
@@ -132,8 +132,7 @@ ProgramRAG/
 
 | 密钥 | 是否必填 | 用途 | 申请 |
 |---|---|---|---|
-| `DEEPSEEK_API_KEY` | ✅ 必填 | LLM 生成回答（无它问答接口返回 503） | https://platform.deepseek.com |
-| `DASHSCOPE_API_KEY` | 可选 | 图片 OCR（Qwen-VL-Max），不传图片可跳过 | https://dashscope.console.aliyun.com |
+| `DEEPSEEK_API_KEY` | ✅ 必填 | LLM 生成回答 + 图片识别（多模态，同一 Key；无它问答接口返回 503） | https://platform.deepseek.com |
 
 ### 4.2 安装基础软件
 
@@ -155,9 +154,8 @@ ProgramRAG/
 
 ### 4.3 申请 API 密钥
 
-1. 打开 https://platform.deepseek.com → 注册/登录 → 左侧「API Keys」→ 创建密钥（形如 `sk-...`），**复制保存**（只显示一次）。
-2. （可选）打开 https://dashscope.console.aliyun.com → 开通 DashScope → 获取 API Key，用于图片 OCR。
-3. 充值少量余额（DeepSeek 问答极便宜，几块钱能用很久）。
+1. 打开 https://platform.deepseek.com → 注册/登录 → 左侧「API Keys」→ 创建密钥（形如 `sk-...`），**复制保存**（只显示一次）。文本问答与图片识别共用这一个 Key。
+2. 充值少量余额（DeepSeek 问答极便宜，几块钱能用很久）。
 
 ### 4.4 获取项目代码并配置 .env
 
@@ -372,10 +370,9 @@ python backend/scripts/smoke_test.py
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | — | DeepSeek LLM 密钥（必填） |
+| `DEEPSEEK_API_KEY` | — | DeepSeek 密钥（必填；文本 + 图片识别共用） |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | LLM 端点 |
-| `MODEL` | `deepseek-v4-flash` | LLM 模型名 |
-| `DASHSCOPE_API_KEY` | — | 图片 OCR 密钥（Qwen-VL-Max，可选） |
+| `MODEL` | `deepseek-flash` | 模型名（多模态，文本与图片统一走它） |
 | `QDRANT_MODE` | `local` | `local`=本地落盘 / `server`=Docker 容器 |
 | `QDRANT_PATH` | `backend/data/qdrant` | local 模式数据目录 |
 | `EMBEDDING_MODEL` | `BAAI/bge-large-zh-v1.5` | 嵌入模型（首次启动自动下载） |
@@ -405,11 +402,11 @@ python backend/scripts/smoke_test.py
 | GET | `/api/documents/{id}/status` | 后台任务状态轮询 |
 | GET | `/api/documents` | 文档列表 |
 | DELETE | `/api/documents/{id}` | 删除（处理中返回 409） |
-| POST | `/api/chat` | 问答（响应头 `X-Cache: HIT/MISS`，带 `conversation_id` 则读库取历史并落库；Agent 下 `web_search` 仅作联网 hint） |
-| POST | `/api/chat/stream` | SSE 流式问答（Agent 下：thought/tool_call/tool_result → sources → delta* → done，`done` 带 `tool_trace`；同样支持会话落库与联网搜索） |
+| POST | `/api/chat` | 问答（响应头 `X-Cache: HIT/MISS`，带 `conversation_id` 则读库取历史并落库；Agent 下 `web_search` 仅作联网 hint；`regenerate: true` 时服务端回退最后一条回答并复用 user 消息） |
+| POST | `/api/chat/stream` | SSE 流式问答（Agent 下：thought/tool_call/tool_result → sources → delta* → done，`done` 带 `tool_trace`；同样支持会话落库、联网搜索与 `regenerate` 重新生成，且会跳过缓存） |
 | GET | `/api/conversations` | 会话列表（左侧栏） |
 | POST | `/api/conversations` | 新建会话 |
-| GET | `/api/conversations/{id}` | 会话详情（含全部消息与引用） |
+| GET | `/api/conversations/{id}` | 会话详情（含全部消息、引用来源、工具轨迹与思考过程） |
 | DELETE | `/api/conversations/{id}` | 删除会话 |
 | GET/POST/DELETE | `/api/agent/memories` | 长期记忆（Agent 工作台）CRUD 与统计 |
 | GET | `/api/agent/tools` | 17 个工具的名称/描述/参数 schema（工作台） |

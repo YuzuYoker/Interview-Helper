@@ -15,15 +15,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM（DeepSeek，OpenAI 兼容）
+    # LLM（DeepSeek，OpenAI 兼容；deepseek-flash 同时支持文本与图片输入）
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
-    model: str = "deepseek-v4-flash"
-
-    # 多模态（Qwen-VL-Max，DashScope OpenAI 兼容端点）
-    dashscope_api_key: str = ""
-    dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    vision_model: str = "qwen-vl-max"
+    model: str = "deepseek-flash"
 
     # Qdrant 向量库（local 本地落盘 | server 远程容器）
     # 两个集合分离：kb_references=面试 skill 参考（只读种子），kb_documents=用户上传（读写）。

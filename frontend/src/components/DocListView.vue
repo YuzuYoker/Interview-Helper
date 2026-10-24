@@ -80,51 +80,106 @@ async function onDelete(doc) {
   }
 }
 
+function formatTime(v) {
+  if (!v) return ''
+  const d = new Date(v)
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleString()
+}
+
 onMounted(refresh)
 </script>
 
 <template>
-  <div class="doc-view">
+  <section class="page">
+    <header class="page-header">
+      <div class="page-heading">
+        <div class="page-eyebrow">KNOWLEDGE BASE</div>
+        <h1 class="page-title">知识库</h1>
+        <p class="page-subtitle">上传简历、面经与岗位资料，让回答有据可依</p>
+      </div>
+      <div class="page-actions">
+        <span class="count-badge">{{ docs.length }} 个文档</span>
+        <button class="btn btn-secondary" type="button" :disabled="loading" @click="refresh">
+          刷新
+        </button>
+      </div>
+    </header>
+
     <div
       class="drop-zone"
       :class="{ dragover }"
+      role="button"
+      tabindex="0"
       @click="fileInput.click()"
+      @keydown.enter.prevent="fileInput.click()"
+      @keydown.space.prevent="fileInput.click()"
       @dragover.prevent="dragover = true"
       @dragleave="dragover = false"
       @drop.prevent="onDrop"
     >
-      <div class="big">📄</div>
-      <div>拖拽文件到此处，或点击选择文件</div>
-      <div class="sub">支持 PDF / Word / Excel / txt / 图片（图片自动走 Qwen-VL 文字识别）</div>
-      <div class="formats">不支持 .doc 旧格式 · 图片建议 &lt;10MB</div>
+      <div class="drop-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 3.5h8L19 8.5v12H6z" />
+          <path d="M14 3.5v5h5" />
+          <path d="M12 17v-5M9.5 14.5 12 12l2.5 2.5" />
+        </svg>
+      </div>
+      <strong>拖拽文件到此处，或点击选择文件</strong>
+      <div class="drop-hint">支持 PDF / Word / Excel / TXT / 图片（图片由 DeepSeek 多模态识别）</div>
+      <div class="drop-hint muted">不支持 .doc 旧格式 · 单文件建议 ≤10MB</div>
       <input ref="fileInput" type="file" multiple hidden @change="onPick" />
     </div>
 
-    <div class="upload-status">
-      <div v-for="(u, i) in uploads" :key="i" class="item" :class="u.status">
-        <span v-if="u.status === 'uploading'">⏳</span>
-        <span v-else-if="u.status === 'ok'">✅</span>
-        <span v-else>❌</span>
-        {{ u.name }} <span style="opacity:.7">{{ u.message }}</span>
+    <div v-if="uploads.length" class="upload-list">
+      <div v-for="(u, i) in uploads" :key="i" class="upload-row" :class="u.status">
+        <span class="upload-icon">
+          <span v-if="u.status === 'processing'" class="mini-spinner"></span>
+          <template v-else-if="u.status === 'ok'">✓</template>
+          <template v-else>!</template>
+        </span>
+        <span class="upload-name">{{ u.name }}</span>
+        <span class="upload-msg">{{ u.message }}</span>
       </div>
     </div>
 
-    <div class="doc-list">
-      <h3>知识库文档（{{ docs.length }}）</h3>
-      <div v-if="loading" style="color:var(--text-dim);font-size:13px">加载中…</div>
-      <div v-else-if="!docs.length" class="doc-empty">知识库为空，上传你的面试资料开始</div>
-      <div v-for="doc in docs" :key="doc.document_id" class="doc-item">
-        <span class="icon">📚</span>
-        <div class="info">
-          <div class="name">
-            {{ doc.filename }}
-            <span v-if="doc.status === 'processing'" style="color:var(--yellow);font-size:12px">⏳ 处理中</span>
-            <span v-else-if="doc.status === 'error'" style="color:var(--danger);font-size:12px">⚠ 处理失败</span>
-          </div>
-          <div class="meta">{{ doc.status === 'indexed' ? doc.chunk_count + ' 个分块' : '后台任务' }} · {{ new Date(doc.created_at).toLocaleString() }}</div>
-        </div>
-        <button class="del-btn" :disabled="doc.status === 'processing'" @click="onDelete(doc)">删除</button>
+    <section class="doc-section">
+      <div class="section-head">
+        <h2>全部文档</h2>
+        <span class="section-count">{{ docs.length }}</span>
       </div>
-    </div>
-  </div>
+
+      <div v-if="loading" class="page-empty">加载中…</div>
+      <div v-else-if="!docs.length" class="page-empty">
+        <div class="empty-icon">📄</div>
+        <p>知识库为空，上传你的面试资料开始</p>
+      </div>
+      <div v-else class="doc-list">
+        <div v-for="doc in docs" :key="doc.document_id" class="doc-row">
+          <span class="doc-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M6 3.5h8L19 8.5v12H6z" />
+              <path d="M14 3.5v5h5" />
+            </svg>
+          </span>
+          <div class="doc-info">
+            <div class="doc-name">{{ doc.filename }}</div>
+            <div class="doc-meta">
+              {{ doc.status === 'indexed' ? doc.chunk_count + ' 个分块' : '后台任务' }}
+              <template v-if="formatTime(doc.created_at)"> · {{ formatTime(doc.created_at) }}</template>
+            </div>
+          </div>
+          <span v-if="doc.status === 'processing'" class="badge warning">处理中</span>
+          <span v-else-if="doc.status === 'error'" class="badge danger">处理失败</span>
+          <span v-else class="badge success">已索引</span>
+          <button
+            class="text-btn danger"
+            type="button"
+            :disabled="doc.status === 'processing'"
+            title="删除文档"
+            @click="onDelete(doc)"
+          >删除</button>
+        </div>
+      </div>
+    </section>
+  </section>
 </template>

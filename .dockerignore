@@ -2,7 +2,6 @@
 node_modules/
 .env
 backend/data/
-shopkeeper-agent/
 backend/.venv/
 frontend/node_modules/
 frontend/dist/

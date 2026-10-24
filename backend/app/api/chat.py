@@ -15,6 +15,7 @@ import threading
 from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
+from app.core.log import logger
 from app.models.chat import ChatRequest, ChatResponse
 from app.rag.generator import (
     build_answer_cached,
@@ -69,32 +70,50 @@ def _check_request(req: ChatRequest) -> None:
         raise HTTPException(400, "问题不能为空")
 
 
-def _resolve(req: ChatRequest) -> tuple[str | None, list[dict]]:
-    """返回 (conversation_id, 服务端权威历史)。
+def _resolve(req: ChatRequest) -> tuple[str | None, list[dict], str, bool]:
+    """返回 (conversation_id, 服务端权威历史, 本轮问题, 是否需要新落库 user 消息)。
 
-    有 conversation_id：读库取历史（不含当前问题，最新一条是上轮 assistant）。
-    无 conversation_id：回退请求内 history（兼容 smoke_test 等旧调用）。
+    - 普通一轮：history = 库里已有消息（不含当前问题），persist_user=True；
+    - regenerate（重新生成 / 重试）：服务端在同一事务里删除最后一条 user 之后的
+      assistant 消息，复用已落库的 user 内容，persist_user=False，避免重复问答轮次；
+    - 无 conversation_id：回退请求内 history（兼容 smoke_test 等旧调用）。
     """
-    if req.conversation_id:
-        conv = conversations.get_conversation(req.conversation_id)
-        if conv is None:
-            raise HTTPException(404, f"会话不存在: {req.conversation_id}")
-        return req.conversation_id, [
-            {"role": m["role"], "content": m["content"]} for m in conv["messages"]
-        ]
-    return None, req.history or []
+    question = req.question.strip()
+    if not req.conversation_id:
+        return None, req.history or [], question, True
+
+    conv = conversations.get_conversation(req.conversation_id)
+    if conv is None:
+        raise HTTPException(404, f"会话不存在: {req.conversation_id}")
+
+    if req.regenerate:
+        rewound = conversations.rewind_last_turn(
+            req.conversation_id, expected_question=question
+        )
+        if rewound is not None:
+            stored_question, history = rewound
+            return req.conversation_id, history, stored_question or question, False
+        # 库里没有匹配的 user 消息（旧异常会话 / 请求在落库前失败）：退回普通一轮
+
+    return (
+        req.conversation_id,
+        [{"role": m["role"], "content": m["content"]} for m in conv["messages"]],
+        question,
+        True,
+    )
 
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, response: Response):
     _check_request(req)
-    conv_id, history = _resolve(req)
-    question = req.question.strip()
+    conv_id, history, question, persist_user = _resolve(req)
 
-    if conv_id:
+    if conv_id and persist_user:
         conversations.append_message(conv_id, "user", question)  # 先落库，防生成失败丢失
     web_flag = req.web_search  # Agent：仅 hint；传统：联网开关
-    resp, hit = build_answer_cached(question, history, req.top_k, web_search=web_flag)
+    resp, hit = build_answer_cached(
+        question, history, req.top_k, web_search=web_flag, bypass_cache=req.regenerate
+    )
     response.headers["X-Cache"] = "HIT" if hit else "MISS"
 
     if conv_id:
@@ -106,7 +125,7 @@ def chat(req: ChatRequest, response: Response):
             resp.tool_trace,
         )
         _maybe_extract_memories(question, resp.answer, conv_id)
-        if not history:  # 首条消息 → 后台生成标题
+        if not history and persist_user:  # 首条消息 → 后台生成标题
             _maybe_generate_title(conv_id, question)
     return resp
 
@@ -118,28 +137,33 @@ async def chat_stream(req: ChatRequest):
     注意：不设 response_model（FastAPI 会尝试校验流式响应）。
     """
     _check_request(req)
-    conv_id, history = _resolve(req)
-    question = req.question.strip()
+    conv_id, history, question, persist_user = _resolve(req)
 
     async def gen():
         sources_data: list[dict] = []
         trace_data: list[dict] = []
+        thought_data: list[str] = []
         partial: list[str] = []
-        if conv_id:
+        persisted = False  # done 已落库，防止取消路径重复写 assistant
+        if conv_id and persist_user:
             conversations.append_message(conv_id, "user", question)
         web_flag = req.web_search
         try:
             async for event, payload in stream_answer_cached(
-                question, history, req.top_k, web_search=web_flag
+                question,
+                history,
+                req.top_k,
+                web_search=web_flag,
+                bypass_cache=req.regenerate,
             ):
-                yield (
-                    f"event: {event}\n"
-                    f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                )
+                # 先记账、done 先落库、最后 yield：
+                # 客户端断开时生成器会在 yield 处被取消，yield 之后的代码不会执行。
                 if event == "sources":
                     sources_data = payload.get("sources", [])
                 elif event == "delta":
                     partial.append(payload.get("content", ""))
+                elif event == "thought":
+                    thought_data.append(payload.get("message", ""))
                 elif event == "tool_call":
                     trace_data.append(
                         {"type": "tool_call", "name": payload.get("name"),
@@ -154,21 +178,35 @@ async def chat_stream(req: ChatRequest):
                          "tool_call_id": payload.get("tool_call_id")}
                     )
                 if conv_id and event == "done" and payload.get("answer"):
-                    conversations.append_message(
-                        conv_id,
-                        "assistant",
-                        payload["answer"],
-                        sources_data,
-                        payload.get("tool_trace") or trace_data,
-                    )
+                    try:
+                        conversations.append_message(
+                            conv_id,
+                            "assistant",
+                            payload["answer"],
+                            sources_data,
+                            payload.get("tool_trace") or trace_data,
+                            thought_data,
+                        )
+                        persisted = True
+                    except Exception:
+                        logger.exception("assistant 消息落库失败")
                     _maybe_extract_memories(question, payload["answer"], conv_id)
-                    if not history:  # 首条消息 → 后台生成标题
+                    if not history and persist_user:  # 首条消息 → 后台生成标题
                         _maybe_generate_title(conv_id, question)
+                yield (
+                    f"event: {event}\n"
+                    f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                )
         except asyncio.CancelledError:
-            # 用户中断：尽量保留已有部分（有内容才落库，保守）
-            if conv_id and "".join(partial).strip():
+            # 用户中断：已落库则不重复；否则保留已生成的部分（有内容才落库，保守）
+            if conv_id and not persisted and "".join(partial).strip():
                 conversations.append_message(
-                    conv_id, "assistant", "".join(partial), sources_data, trace_data
+                    conv_id,
+                    "assistant",
+                    "".join(partial),
+                    sources_data,
+                    trace_data,
+                    thought_data,
                 )
             raise
 
